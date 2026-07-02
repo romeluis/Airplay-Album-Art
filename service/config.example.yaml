@@ -1,0 +1,19 @@
+# Copy to config.yaml (git-ignored) and adjust. See ../design.md.
+
+server:
+  host: 0.0.0.0
+  port: 8765
+
+discovery:
+  # true: monitor every HomePod found on the network.
+  # false: only the devices listed below.
+  auto: true
+
+# Used when discovery.auto is false, or to attach pairing credentials.
+# Find identifiers with: uv run atvremote scan
+homepods:
+  - name: Living Room
+    identifier: "AA:BB:CC:DD:EE:FF"
+    # credentials: ""   # from `uv run atvremote --id <ID> --protocol airplay pair`
+  - name: Bedroom
+    identifier: "11:22:33:44:55:66"

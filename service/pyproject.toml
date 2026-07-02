@@ -1,0 +1,22 @@
+[project]
+name = "airplay-art"
+version = "0.1.0"
+description = "Monitors HomePods via pyatv and pushes 64x64 album art to an ESP32 display over WebSocket"
+readme = "README.md"
+authors = [
+    { name = "Romel Luis Faife Cruz", email = "113552563+romeluis@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "pillow>=12.3.0",
+    "pyatv>=0.18.0",
+    "pyyaml>=6.0.3",
+    "websockets>=16.0",
+]
+
+[project.scripts]
+airplay-art = "airplay_art.main:main"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
