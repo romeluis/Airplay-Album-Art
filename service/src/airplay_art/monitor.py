@@ -14,9 +14,11 @@ from dataclasses import dataclass, field
 
 import pyatv
 from pyatv import interface
-from pyatv.const import DeviceState, Protocol
+from pyatv.const import DeviceState, MediaType, Protocol
 
 from .art import BLACK_ART, process_artwork
+from .cache import ArtCache
+from .lookup import fetch_supplementary_artwork
 from .server import Broadcaster
 
 log = logging.getLogger(__name__)
@@ -24,6 +26,11 @@ log = logging.getLogger(__name__)
 _SCAN_TIMEOUT = 5
 _MAX_BACKOFF = 30
 _PUSH_RESTART_DELAY = 5
+
+# Native artwork often lags the track-change push by a moment; retry before
+# falling back to the iTunes lookup.
+_ART_ATTEMPTS = 4
+_ART_RETRY_DELAY = 1.5
 
 
 class DeviceMonitor(interface.PushListener, interface.DeviceListener):
@@ -125,12 +132,14 @@ class _DeviceEntry:
 class Coordinator:
     """Arbitrates the active source across all HomePods and emits updates."""
 
-    def __init__(self, broadcaster: Broadcaster) -> None:
+    def __init__(self, broadcaster: Broadcaster, cache: ArtCache | None = None) -> None:
         self._broadcaster = broadcaster
+        self._cache = cache
         self._devices: dict[str, _DeviceEntry] = {}
         self._active_id: str | None = None
         self._art_key: str | None = None  # (device, track-hash) of last art fetch
         self._art_task: asyncio.Task | None = None
+        self._art_pending = False  # a fetch is in flight; clients show a loading animation
 
     def add_homepod(self, identifier: str, name: str, credentials: str | None = None) -> None:
         if identifier in self._devices:
@@ -147,9 +156,10 @@ class Coordinator:
         if _is_playing(playstatus) and not was_playing:
             entry.last_play_transition = time.monotonic()
         log.info(
-            "%s: %s — %s / %s / %s (%s/%ss)",
+            "%s: %s [%s] — %s / %s / %s (%s/%ss)",
             monitor.name,
             playstatus.device_state.name,
+            playstatus.media_type.name,
             playstatus.title,
             playstatus.artist,
             playstatus.album,
@@ -185,11 +195,16 @@ class Coordinator:
         ps = entry.playstatus
         assert ps is not None
 
+        # Right after an AirPlay stream starts, the first push updates can have
+        # empty metadata; wait for the follow-up that fills it in before
+        # resolving artwork (avoids flashing black art for a real track).
+        has_metadata = ps.title is not None or ps.artist is not None
         art_key = f"{new_active}:{ps.hash}"
-        if art_key != self._art_key:
+        if has_metadata and art_key != self._art_key:
             self._art_key = art_key
             if self._art_task is not None:
                 self._art_task.cancel()
+            self._art_pending = True
             self._art_task = asyncio.create_task(self._fetch_art(entry.monitor, ps))
 
         self._emit_state(ps)
@@ -199,21 +214,54 @@ class Coordinator:
             playing=True,
             position=float(ps.position or 0),
             duration=float(ps.total_time or 0),
+            art_pending=self._art_pending,
         )
 
     async def _fetch_art(self, monitor: DeviceMonitor, ps: interface.Playing) -> None:
-        art = BLACK_ART
-        atv = monitor.atv
-        try:
-            if atv is not None:
-                info = await atv.metadata.artwork(width=256, height=256)
+        # Resolution chain: cache -> native artwork (with retries) -> lookup
+        # APIs -> black. Successful resolutions are written back to the cache.
+        art = None
+        source = "cache"
+        cache_key = ArtCache.key_for(ps) if self._cache else None
+        if cache_key:
+            art = await asyncio.to_thread(self._cache.get, cache_key)
+
+        if art is None:
+            source = "native"
+            for attempt in range(_ART_ATTEMPTS):
+                if attempt:
+                    await asyncio.sleep(_ART_RETRY_DELAY)
+                atv = monitor.atv
+                if atv is None:
+                    break
+                try:
+                    info = await atv.metadata.artwork(width=256, height=256)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.debug("%s: artwork attempt %d failed: %s", monitor.name, attempt + 1, exc)
+                    info = None
                 if info is not None and info.bytes:
                     art = await asyncio.to_thread(process_artwork, info.bytes)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning("%s: artwork fetch failed (%s), using black", monitor.name, exc)
-        log.info("%s: artwork %s (separator=%s)", monitor.name, art.art_id, art.separator)
+                    break
+
+            if art is None:
+                raw = await fetch_supplementary_artwork(ps)
+                if raw:
+                    art = await asyncio.to_thread(process_artwork, raw)
+                    source = "lookup"
+
+            if art is not None and cache_key:
+                await asyncio.to_thread(self._cache.put, cache_key, art)
+
+        if art is None:
+            art = BLACK_ART
+            source = "none"
+        self._art_pending = False
+        log.info(
+            "%s: artwork %s (source=%s, separator=%s)",
+            monitor.name, art.art_id, source, art.separator,
+        )
         self._broadcaster.set_art(art)
         # Re-emit state so clients get the new art_id/separator with fresh position.
         entry = self._devices[monitor.identifier]
@@ -223,4 +271,10 @@ class Coordinator:
 
 
 def _is_playing(ps: interface.Playing | None) -> bool:
-    return ps is not None and ps.device_state == DeviceState.Playing
+    # Music only: HomePods also act as TV speakers (Apple TV audio routing);
+    # shows/movies must not take over the display.
+    return (
+        ps is not None
+        and ps.device_state == DeviceState.Playing
+        and ps.media_type == MediaType.Music
+    )

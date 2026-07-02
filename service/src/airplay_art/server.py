@@ -59,6 +59,7 @@ class Broadcaster:
         playing: bool,
         position: float = 0.0,
         duration: float = 0.0,
+        art_pending: bool = False,
         art_id: str | None = None,
         separator: bool | None = None,
     ) -> None:
@@ -72,6 +73,7 @@ class Broadcaster:
                     "position": position,
                     "duration": duration,
                     "ts": time.time(),
+                    "art_pending": art_pending,
                     "art_id": art_id if art_id is not None else self._art.art_id,
                     "separator": separator if separator is not None else self._art.separator,
                 }

@@ -9,6 +9,12 @@ discovery:
   # false: only the devices listed below.
   auto: true
 
+cache:
+  # On-disk artwork cache (~8 KB per album); replayed tracks resolve instantly.
+  enabled: true
+  # dir: ~/Library/Caches/airplay-art
+  max_mb: 1024
+
 # Used when discovery.auto is false, or to attach pairing credentials.
 # Find identifiers with: uv run atvremote scan
 homepods:

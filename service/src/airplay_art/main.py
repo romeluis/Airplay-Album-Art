@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from pathlib import Path
 
 import pyatv
 from websockets.asyncio.server import serve
 
+from .cache import ArtCache
 from .config import Config, load_config
 from .monitor import Coordinator
 from .server import Broadcaster
@@ -44,7 +46,11 @@ async def _discovery_loop(coordinator: Coordinator) -> None:
 
 async def _run(config: Config) -> None:
     broadcaster = Broadcaster()
-    coordinator = Coordinator(broadcaster)
+    cache = None
+    if config.cache_enabled:
+        cache = ArtCache(Path(config.cache_dir).expanduser(), config.cache_max_mb * 1024 * 1024)
+        log.info("art cache: %s (max %d MB)", cache.directory, config.cache_max_mb)
+    coordinator = Coordinator(broadcaster, cache)
 
     for hp in config.homepods:
         coordinator.add_homepod(hp.identifier, hp.name, hp.credentials)

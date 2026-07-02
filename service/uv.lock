@@ -147,6 +147,7 @@ name = "airplay-art"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "pillow" },
     { name = "pyatv" },
     { name = "pyyaml" },
@@ -155,6 +156,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.14.1" },
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "pyatv", specifier = ">=0.18.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
