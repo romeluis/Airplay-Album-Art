@@ -146,35 +146,41 @@ static void composeAndShow(int fill) {
   output.show(canvas);
 }
 
-// Artwork loading: spinner of 8 gray dots on a black canvas, brightness
-// rotating around the ring (head bright, fading tail). Progress bar stays
-// visible.
+// Artwork loading: Apple-style spinner — 8 gray spokes radiating from the
+// center, brightness rotating counter-clockwise (head bright, fading tail).
+// Progress bar stays visible.
 static constexpr uint32_t kSpinnerStepMs = 100;  // full revolution ~0.8s
 
 static constexpr uint16_t gray565(uint8_t g) {
   return (uint16_t)(((g >> 3) << 11) | ((g >> 2) << 5) | (g >> 3));
 }
 
-// Dot offsets from center, clockwise from 12 o'clock (radius 14).
-static constexpr int8_t kSpinnerPos[8][2] = {
-    {0, -14}, {10, -10}, {14, 0}, {10, 10}, {0, 14}, {-10, 10}, {-14, 0}, {-10, -10},
+// Spoke unit directions, clockwise from 12 o'clock.
+static constexpr float kSpokeDir[8][2] = {
+    {0, -1}, {0.7071f, -0.7071f}, {1, 0},  {0.7071f, 0.7071f},
+    {0, 1},  {-0.7071f, 0.7071f}, {-1, 0}, {-0.7071f, -0.7071f},
 };
 static constexpr uint16_t kSpinnerLevels[8] = {
     gray565(255), gray565(180), gray565(125), gray565(85),
     gray565(58),  gray565(40),  gray565(26),  gray565(16),
 };
+static constexpr int kSpokeInner = 6;
+static constexpr int kSpokeOuter = 13;
 static constexpr int kSpinnerCx = CANVAS_W / 2;
 static constexpr int kSpinnerCy = 30;  // nudged up to clear the progress bar
 
 static void composeLoadingAndShow(int step, int fill) {
   memset(canvas, 0, sizeof(canvas));
   for (int i = 0; i < 8; i++) {
-    uint16_t level = kSpinnerLevels[(i - step + 8) % 8];
-    int x0 = kSpinnerCx + kSpinnerPos[i][0] - 1;  // 2x2 dots
-    int y0 = kSpinnerCy + kSpinnerPos[i][1] - 1;
-    for (int dy = 0; dy < 2; dy++) {
-      for (int dx = 0; dx < 2; dx++) {
-        canvas[(y0 + dy) * CANVAS_W + (x0 + dx)] = level;
+    // (i + step): the bright head advances counter-clockwise over time.
+    uint16_t level = kSpinnerLevels[(i + step) % 8];
+    for (int t = kSpokeInner; t <= kSpokeOuter; t++) {
+      int x = kSpinnerCx + (int)lroundf(kSpokeDir[i][0] * t) - 1;  // 2x2 blocks
+      int y = kSpinnerCy + (int)lroundf(kSpokeDir[i][1] * t) - 1;
+      for (int dy = 0; dy < 2; dy++) {
+        for (int dx = 0; dx < 2; dx++) {
+          canvas[(y + dy) * CANVAS_W + (x + dx)] = level;
+        }
       }
     }
   }

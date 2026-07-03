@@ -104,10 +104,11 @@ have empty metadata — art resolution waits for metadata and falls back):
 4. **Deezer search API** — field-scoped `artist:"…" track:"…"` queries with
    precise ranking; album search as a second pass.
 5. **iTunes Search API** — fuzzy, last resort.
-6. **Black** placeholder.
+6. **Music-note placeholder** — gray beamed eighth notes on black, generated
+   server-side so it renders identically on every display.
 
-Successful native/lookup resolutions are written back to the cache; black
-placeholders are never cached (a later replay retries the full chain).
+Successful native/lookup resolutions are written back to the cache; the
+placeholder is never cached (a later replay retries the full chain).
 
 All APIs are keyless. Every non-exact result is validated against the track's
 artist AND title/album (DJ-mix segments etc. carry the artist's name with
@@ -220,10 +221,11 @@ Output drivers implement one interface (`begin()`, `show(const uint16_t* canvas)
   the white fill is drawn on top — both the bar and its empty track stay
   readable on white album art.
 - `duration` missing/0 → no bar (art only).
-- **Artwork loading** (`art_pending` in the state frame): black canvas with a
-  spinner — 8 gray 2x2 dots on a radius-14 ring, brightness rotating clockwise
-  (~0.8s per revolution, head bright with fading tail), progress bar still
-  drawn. Ends when a state with `art_pending: false` arrives.
+- **Artwork loading** (`art_pending` in the state frame): black canvas with an
+  Apple-style spinner — 8 gray spokes (radius 6→13 from center), brightness
+  rotating counter-clockwise (~0.8s per revolution, bright head with fading
+  tail), progress bar still drawn. Ends when a state with `art_pending: false`
+  arrives.
 - **Local interpolation:** the server sends `position`, `duration`, `ts`. While
   `playing`, the firmware advances position every frame using `millis()` since the
   last `state` frame, clamped to `duration`. Each incoming `state` re-syncs it —

@@ -16,7 +16,7 @@ import pyatv
 from pyatv import interface
 from pyatv.const import DeviceState, MediaType, Protocol
 
-from .art import BLACK_ART, process_artwork
+from .art import NOTE_ART, process_artwork
 from .cache import ArtCache
 from .lookup import fetch_supplementary_artwork
 from .server import Broadcaster
@@ -255,7 +255,7 @@ class Coordinator:
                 await asyncio.to_thread(self._cache.put, cache_key, art)
 
         if art is None:
-            art = BLACK_ART
+            art = NOTE_ART  # music-note placeholder; never cached
             source = "none"
         self._art_pending = False
         log.info(
