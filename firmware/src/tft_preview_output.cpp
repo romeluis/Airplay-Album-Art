@@ -1,3 +1,5 @@
+#ifdef OUTPUT_TFT_PREVIEW
+
 #include "tft_preview_output.h"
 
 void TftPreviewOutput::begin() {
@@ -31,3 +33,5 @@ void TftPreviewOutput::show(const uint16_t* canvas) {
 void TftPreviewOutput::showBlack() {
   tft_.fillScreen(ST77XX_BLACK);
 }
+
+#endif

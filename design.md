@@ -8,8 +8,8 @@ playing (or the server is unreachable), the display is solid black.
 
 | Stage | Display | Controller |
 |---|---|---|
-| Now (interim) | Adafruit ESP32-S3 Reverse TFT Feather — 240x135 ST7789 TFT | same board |
-| Final | 64x64 P3 HUB75 RGB LED matrix (192x192mm, 1/32 scan, 5V, SMD2121) | displayless ESP32-S3 |
+| Preview | Adafruit ESP32-S3 Reverse TFT Feather — 240x135 ST7789 TFT | same board |
+| Matrix | 64x64 P3 HUB75 RGB LED matrix (192x192mm, 1/32 scan, 5V, SMD2121) | Adafruit ESP32-S3 Reverse TFT Feather, built-in TFT unused |
 
 The interim TFT shows a **letterboxed preview** of the exact same 64x64 frame the
 matrix would receive (see [Rendering](#rendering)). Swapping to the real matrix
@@ -190,9 +190,16 @@ Logs go to `~/Library/Logs/airplay-art.log` (path set in the plist).
 
 ## ESP32 firmware (`firmware/`)
 
-PlatformIO, Arduino framework, board `adafruit_feather_esp32s3_reversetft`.
-Libraries: Adafruit GFX + ST7789 (interim display), `links2004/WebSockets`
-(event-driven client with auto-reconnect). Later: `ESP32-HUB75-MatrixPanel-I2S-DMA`.
+PlatformIO, Arduino framework. Build environments:
+
+- `tft-preview`: Adafruit ESP32-S3 Reverse TFT Feather preview.
+- `hub75-p3`: same Feather driving the P3 HUB75 matrix.
+- `hub75-p3-s3-devkit`: ESP32-S3 dev board driving the P3 HUB75 matrix, with
+  INMP441 audio input and a mode button.
+
+Libraries: Adafruit GFX + ST7789 (TFT preview), `ESP32-HUB75-MatrixPanel-I2S-DMA`
+(matrix), `links2004/WebSockets` (event-driven client with auto-reconnect), and
+ArduinoJson.
 
 ### Rendering
 
@@ -203,14 +210,26 @@ truth. Every frame:
 2. Overlay the progress bar (below).
 3. Hand the canvas to the active **output driver**.
 
-Output drivers implement one interface (`begin()`, `show(const uint16_t* canvas)`):
+Output drivers implement one interface (`begin()`, `show(const uint16_t* canvas)`,
+`showBlack()`, optional `setBrightness(uint8_t)`):
 
-- **`TftPreviewOutput` (now):** nearest-neighbor **2x** scale → 128x128, centered
+- **`TftPreviewOutput`:** nearest-neighbor **2x** scale → 128x128, centered
   on the 240x135 ST7789. 135−128 = 7 → 3px top / 4px bottom black bars; 240−128 =
   112 → 56px black bars left/right. Integer scale + nearest neighbor = pixel-exact
   preview of what the matrix will show.
-- **`Hub75Output` (later):** blit the canvas 1:1 to the matrix via the HUB75 DMA
+- **`Hub75Output`:** blit the canvas 1:1 to the matrix via the HUB75 DMA
   library. Selected by a PlatformIO build flag; nothing else changes.
+
+The audio-reactive ESP32-S3 dev-board build adds a pushbutton mode cycle:
+
+1. **Art:** album art + progress bar.
+2. **ArtBass:** album art + progress bar, with HUB75 brightness boosted by
+   smoothed bass energy.
+3. **SoundBars:** black background with 16 audio bars and white peak decay;
+   the progress bar remains visible when duration is known.
+
+Modes reset to Art on reboot. Idle/disconnected and artwork-loading states ignore
+the selected visual mode and stay black/spinner as before.
 
 ### Progress bar
 
@@ -256,17 +275,75 @@ now; on the matrix, black pixels = LEDs off anyway.
 
 ---
 
-## Future: HUB75 migration
+## HUB75 matrix wiring
 
-1. Add `ESP32-HUB75-MatrixPanel-I2S-DMA` to `lib_deps`.
-2. Implement `Hub75Output` (canvas is already the matrix's native 64x64 RGB565;
-   the library accepts per-pixel RGB565 draws or 565→888 expansion).
-3. Add a `hub75` PlatformIO environment with the displayless board + pin map for
-   the HUB75 connector; build flag selects the output driver.
-4. Panel is 5V/indoor; power it from a proper 5V supply (a 64x64 P3 panel can
-   draw ~3–4A at full white), logic from the ESP32-S3.
+Build the Feather matrix firmware with `pio run -e hub75-p3`, or the ESP32-S3
+dev-board audio-reactive firmware with `pio run -e hub75-p3-s3-devkit`. Both use
+the same 64x64 canvas as the TFT preview and drive the P3 panel 1:1 through the
+`ESP32-HUB75-MatrixPanel-I2S-DMA` library.
 
-No changes to the Python service, the protocol, or the rendering code.
+| Panel signal | Feather ESP32-S3 Reverse TFT pin |
+| --- | --- |
+| R1 | D5 / GPIO5 |
+| G1 | D6 / GPIO6 |
+| B1 | D9 / GPIO9 |
+| R2 | D10 / GPIO10 |
+| G2 | D11 / GPIO11 |
+| B2 | D12 / GPIO12 |
+| A | D13 / GPIO13 |
+| B | A4 / GPIO14 |
+| C | A3 / GPIO15 |
+| D | A2 / GPIO16 |
+| E | A1 / GPIO17 |
+| LAT / STB | A0 / GPIO18 |
+| OE | RX / GPIO38 |
+| CLK | TX / GPIO39 |
+| GND | Any Feather GND, tied to matrix power-supply GND |
+
+This panel is marked `P3(2121)64X64-32S-6.0` and its connector exposes
+`A/B/C/E`, plus a row-select line mislabeled as `GND`/`GRD` where `D` normally
+appears. Connect that mislabeled pin as `D`; do not tie it to ground. The real
+ground pins are the other `GND` pins shown on the connector.
+
+ESP32-S3 dev-board HUB75 wiring:
+
+| Panel signal | ESP32-S3 dev board pin |
+| --- | --- |
+| R1 | GPIO4 |
+| G1 | GPIO5 |
+| B1 | GPIO6 |
+| R2 | GPIO7 |
+| G2 | GPIO15 |
+| B2 | GPIO16 |
+| A | GPIO17 |
+| B | GPIO18 |
+| C | GPIO8 |
+| D | GPIO9, to the panel pin mislabeled `GND`/`GRD` |
+| E | GPIO10 |
+| LAT / STB | GPIO11 |
+| OE | GPIO12 |
+| CLK | GPIO13 |
+| GND | ESP32 GND, tied to matrix power-supply GND |
+
+ESP32-S3 dev-board INMP441 + button wiring:
+
+| Module signal | ESP32-S3 dev board pin |
+| --- | --- |
+| INMP441 VDD | 3V3 |
+| INMP441 GND | GND |
+| INMP441 SCK | GPIO35 |
+| INMP441 WS | GPIO36 |
+| INMP441 SD | GPIO37 |
+| INMP441 L/R | GND |
+| Pushbutton | GPIO21 to GND |
+
+The panel must be powered from a proper external 5V supply; do not power it from
+the controller. A 64x64 P3 panel can draw roughly 3–4A at full white. Tie the
+matrix supply ground and controller ground together. If the panel is unstable with
+3.3V GPIO, add a 74AHCT245/74HCT245 level shifter between the controller and
+HUB75E signals.
+
+No changes to the Python service or WebSocket protocol.
 
 ## Repository layout
 

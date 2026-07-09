@@ -11,4 +11,5 @@ class DisplayOutput {
   virtual void begin() = 0;
   virtual void show(const uint16_t* canvas) = 0;  // CANVAS_PX RGB565 values
   virtual void showBlack() = 0;
+  virtual void setBrightness(uint8_t brightness) {}
 };

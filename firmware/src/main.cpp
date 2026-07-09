@@ -10,18 +10,59 @@
 #include <WebSocketsClient.h>
 #include <WiFi.h>
 
+#include "audio_analyzer.h"
 #include "canvas.h"
+#include "mode_button.h"
 #include "secrets.h"
+
+#if defined(OUTPUT_HUB75) && defined(OUTPUT_TFT_PREVIEW)
+#error "Define only one output driver: OUTPUT_HUB75 or OUTPUT_TFT_PREVIEW"
+#elif defined(OUTPUT_HUB75)
+#include "hub75_output.h"
+#elif defined(OUTPUT_TFT_PREVIEW)
 #include "tft_preview_output.h"
+#else
+#error "Define an output driver: OUTPUT_HUB75 or OUTPUT_TFT_PREVIEW"
+#endif
 
 static constexpr uint16_t kWhite = 0xFFFF;
 static constexpr uint16_t kBlack = 0x0000;
 static constexpr int kArtIdLen = 16;
 static constexpr size_t kArtFrameLen = kArtIdLen + CANVAS_PX * 2;
 static constexpr uint32_t kWsReconnectMs = 2000;
+static constexpr uint8_t kBaseBrightness = 96;
+static constexpr uint32_t kVisualizerFrameMs = 33;
 
+#ifdef AUDIO_REACTIVE
+static constexpr uint8_t kModeButtonPin = 21;
+#endif
+
+#if defined(OUTPUT_HUB75)
+static Hub75Output output;
+#else
 static TftPreviewOutput output;
+#endif
 static WebSocketsClient webSocket;
+
+#ifdef AUDIO_REACTIVE
+static AudioAnalyzer audio;
+static ModeButton modeButton;
+
+enum class DisplayMode { Art, ArtBass, SoundBars };
+static DisplayMode displayMode = DisplayMode::Art;
+
+static const char* displayModeName(DisplayMode mode) {
+  switch (mode) {
+    case DisplayMode::Art:
+      return "art";
+    case DisplayMode::ArtBass:
+      return "art+bass";
+    case DisplayMode::SoundBars:
+      return "sound bars";
+  }
+  return "unknown";
+}
+#endif
 
 // Latest artwork received from the server.
 static uint16_t artBuf[CANVAS_PX];
@@ -40,6 +81,25 @@ static double lastRxTs = -1;        // keepalives repeat it; only rebase on chan
 
 static uint16_t canvas[CANVAS_PX];
 static bool needsRedraw = true;
+
+#ifdef AUDIO_REACTIVE
+static void nextDisplayMode() {
+  switch (displayMode) {
+    case DisplayMode::Art:
+      displayMode = DisplayMode::ArtBass;
+      break;
+    case DisplayMode::ArtBass:
+      displayMode = DisplayMode::SoundBars;
+      break;
+    case DisplayMode::SoundBars:
+      displayMode = DisplayMode::Art;
+      break;
+  }
+  output.setBrightness(kBaseBrightness);
+  needsRedraw = true;
+  Serial.printf("mode: %s\n", displayModeName(displayMode));
+}
+#endif
 
 static void handleState(const uint8_t* payload, size_t length) {
   JsonDocument doc;
@@ -155,6 +215,10 @@ static constexpr uint16_t gray565(uint8_t g) {
   return (uint16_t)(((g >> 3) << 11) | ((g >> 2) << 5) | (g >> 3));
 }
 
+static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
 // Spoke unit directions, clockwise from 12 o'clock.
 static constexpr float kSpokeDir[8][2] = {
     {0, -1}, {0.7071f, -0.7071f}, {1, 0},  {0.7071f, 0.7071f},
@@ -188,24 +252,81 @@ static void composeLoadingAndShow(int step, int fill) {
   output.show(canvas);
 }
 
+#ifdef AUDIO_REACTIVE
+static uint8_t barPeaks[16] = {};
+
+static uint16_t barColor(int y) {
+  if (y < 18) return rgb565(255, 255, 255);
+  if (y < 36) return rgb565(40, 210, 255);
+  return rgb565(40, 255, 120);
+}
+
+static void composeBarsAndShow(int fill) {
+  const AudioLevels& levels = audio.levels();
+  memset(canvas, 0, sizeof(canvas));
+
+  for (int band = 0; band < 16; band++) {
+    int height = constrain((int)levels.bands[band], 0, 60);
+    if (height > barPeaks[band]) {
+      barPeaks[band] = height;
+    } else if (barPeaks[band] > 0) {
+      barPeaks[band]--;
+    }
+
+    int x0 = band * 4;
+    for (int y = 0; y < height; y++) {
+      int py = 60 - y;
+      uint16_t color = barColor(py);
+      for (int dx = 0; dx < 3; dx++) {
+        canvas[py * CANVAS_W + x0 + dx] = color;
+      }
+    }
+
+    if (barPeaks[band] > 0) {
+      int peakY = 60 - barPeaks[band];
+      if (peakY >= 0 && peakY < CANVAS_H) {
+        for (int dx = 0; dx < 3; dx++) {
+          canvas[peakY * CANVAS_W + x0 + dx] = kWhite;
+        }
+      }
+    }
+  }
+
+  drawProgressBar(fill, false);
+  output.show(canvas);
+}
+#endif
+
 enum class Mode { Black, Loading, Art };
 
 static void render() {
   static Mode lastMode = Mode::Art;  // force initial black paint
   static int lastFill = -2;
   static int lastStep = -1;
+#ifdef AUDIO_REACTIVE
+  static DisplayMode lastDisplayMode = DisplayMode::Art;
+  static uint32_t lastVisualizerMs = 0;
+#endif
 
   Mode mode = (!wsConnected || !playing) ? Mode::Black
               : (artPending ? Mode::Loading : Mode::Art);
   bool modeChanged = mode != lastMode;
   lastMode = mode;
+#ifdef AUDIO_REACTIVE
+  bool displayModeChanged = displayMode != lastDisplayMode;
+  lastDisplayMode = displayMode;
+#endif
 
   switch (mode) {
     case Mode::Black:
-      if (modeChanged) output.showBlack();
+      if (modeChanged) {
+        output.setBrightness(kBaseBrightness);
+        output.showBlack();
+      }
       needsRedraw = false;
       break;
     case Mode::Loading: {
+      output.setBrightness(kBaseBrightness);
       int step = (int)((millis() / kSpinnerStepMs) % 8);
       int fill = currentFill();
       if (modeChanged || needsRedraw || step != lastStep || fill != lastFill) {
@@ -218,10 +339,35 @@ static void render() {
     }
     case Mode::Art: {
       int fill = currentFill();
-      if (modeChanged || needsRedraw || fill != lastFill) {
-        composeAndShow(fill);
-        lastFill = fill;
-        needsRedraw = false;
+#ifdef AUDIO_REACTIVE
+      if (displayMode == DisplayMode::ArtBass) {
+        uint8_t boost = (uint8_t)lroundf(audio.levels().bass * 110.0f);
+        output.setBrightness(constrain(kBaseBrightness + boost, kBaseBrightness, 220));
+      } else {
+        output.setBrightness(kBaseBrightness);
+      }
+
+      if (displayMode == DisplayMode::SoundBars) {
+        uint32_t now = millis();
+        if (modeChanged || displayModeChanged || needsRedraw || fill != lastFill ||
+            now - lastVisualizerMs >= kVisualizerFrameMs) {
+          composeBarsAndShow(fill);
+          lastVisualizerMs = now;
+          lastFill = fill;
+          needsRedraw = false;
+        }
+      } else
+#endif
+      {
+        if (modeChanged || needsRedraw || fill != lastFill
+#ifdef AUDIO_REACTIVE
+            || displayModeChanged
+#endif
+        ) {
+          composeAndShow(fill);
+          lastFill = fill;
+          needsRedraw = false;
+        }
       }
       break;
     }
@@ -231,6 +377,14 @@ static void render() {
 void setup() {
   Serial.begin(115200);
   output.begin();
+  output.setBrightness(kBaseBrightness);
+
+#ifdef AUDIO_REACTIVE
+  modeButton.begin(kModeButtonPin);
+  if (audio.begin()) {
+    Serial.println("audio: ready");
+  }
+#endif
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -250,6 +404,10 @@ void setup() {
 }
 
 void loop() {
+#ifdef AUDIO_REACTIVE
+  audio.update();
+  if (modeButton.update()) nextDisplayMode();
+#endif
   webSocket.loop();
   render();
   delay(10);
