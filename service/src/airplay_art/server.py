@@ -31,6 +31,7 @@ class Broadcaster:
     def __init__(self) -> None:
         self._clients: set[ServerConnection] = set()
         self._art = BLACK_ART
+        self._playing_fields: dict | None = None  # last playing-state sample
         self._state_msg = json.dumps({"type": "state", "playing": False})
 
     @property
@@ -44,7 +45,7 @@ class Broadcaster:
         try:
             # Full snapshot on connect: art first so the state's art_id resolves.
             await ws.send(_art_frame(self._art))
-            await ws.send(self._state_msg)
+            await ws.send(self._snapshot_state_msg())
             async for _ in ws:  # clients never send application messages
                 pass
         except Exception as exc:
@@ -64,21 +65,41 @@ class Broadcaster:
         separator: bool | None = None,
     ) -> None:
         if not playing:
+            self._playing_fields = None
             self._state_msg = json.dumps({"type": "state", "playing": False})
         else:
-            self._state_msg = json.dumps(
-                {
-                    "type": "state",
-                    "playing": True,
-                    "position": position,
-                    "duration": duration,
-                    "ts": time.time(),
-                    "art_pending": art_pending,
-                    "art_id": art_id if art_id is not None else self._art.art_id,
-                    "separator": separator if separator is not None else self._art.separator,
-                }
-            )
+            self._playing_fields = {
+                "type": "state",
+                "playing": True,
+                "position": position,
+                "duration": duration,
+                "ts": time.time(),
+                "art_pending": art_pending,
+                "art_id": art_id if art_id is not None else self._art.art_id,
+                "separator": separator if separator is not None else self._art.separator,
+            }
+            self._state_msg = json.dumps(self._playing_fields)
         self._broadcast(self._state_msg)
+
+    def _snapshot_state_msg(self) -> str:
+        """State frame for a newly connected client.
+
+        State is only sampled on AirPlay push events (track change,
+        play/pause), so the stored sample can be minutes old. A client joining
+        mid-song must not take it as current — extrapolate the position to now.
+        Broadcasts and keepalives still send the frozen sample; clients that
+        received it fresh interpolate locally.
+        """
+        if self._playing_fields is None:
+            return self._state_msg
+        fields = dict(self._playing_fields)
+        now = time.time()
+        position = fields["position"] + (now - fields["ts"])
+        if fields["duration"] > 0:
+            position = min(position, fields["duration"])
+        fields["position"] = position
+        fields["ts"] = now
+        return json.dumps(fields)
 
     def set_art(self, art: ProcessedArt) -> None:
         if art.art_id == self._art.art_id:

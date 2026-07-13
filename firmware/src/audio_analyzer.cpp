@@ -6,12 +6,14 @@
 #include <math.h>
 
 static constexpr i2s_port_t kI2sPort = I2S_NUM_1;
-// INMP441 on three physically adjacent DevKitC-1 left-rail pins (GPIO9/10/11,
+// INMP441 on four physically adjacent DevKitC-1 left-rail pins (GPIO9..12,
 // below the matrix block; GPIO8 and the strapping pins GPIO3/GPIO46 in between
-// are left free). VDD -> 3V3, GND -> GND, L/R -> GND.
+// are left free). VDD -> 3V3, GND -> GND. L/R is the channel-select logic
+// input; GPIO12 is held LOW (left channel) so it needs no ground wire.
 static constexpr int kMicSckPin = 9;
 static constexpr int kMicWsPin = 10;
 static constexpr int kMicSdPin = 11;
+static constexpr int kMicLrPin = 12;
 
 static constexpr float kPi = 3.14159265358979323846f;
 static constexpr float kBandHz[16] = {
@@ -20,6 +22,11 @@ static constexpr float kBandHz[16] = {
 };
 
 bool AudioAnalyzer::begin() {
+  // Hold L/R low before the I2S clocks start so the mic selects the left
+  // channel (matches I2S_CHANNEL_FMT_ONLY_LEFT below).
+  pinMode(kMicLrPin, OUTPUT);
+  digitalWrite(kMicLrPin, LOW);
+
   i2s_config_t config = {};
   config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
   config.sample_rate = kSampleRate;

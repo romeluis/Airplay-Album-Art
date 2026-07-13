@@ -12,6 +12,7 @@
 
 #ifdef AUDIO_REACTIVE
 #include <ESPmDNS.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #endif
 
@@ -33,6 +34,17 @@ static constexpr size_t kArtFrameLen = kArtIdLen + CANVAS_PX * 2;
 static constexpr uint32_t kWsReconnectMs = 2000;
 static constexpr uint8_t kBaseBrightness = 96;
 static constexpr uint32_t kVisualizerFrameMs = 33;
+
+static constexpr uint16_t gray565(uint8_t g) {
+  return (uint16_t)(((g >> 3) << 11) | ((g >> 2) << 5) | (g >> 3));
+}
+
+static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+// Base display brightness; web-adjustable and persisted to NVS.
+static uint8_t baseBrightness = kBaseBrightness;
 
 #ifdef AUDIO_REACTIVE
 static constexpr uint8_t kArtBassMinBrightness = 24;
@@ -88,7 +100,7 @@ static bool needsRedraw = true;
 #ifdef AUDIO_REACTIVE
 static void setDisplayMode(DisplayMode mode) {
   displayMode = mode;
-  output.setBrightness(kBaseBrightness);
+  output.setBrightness(baseBrightness);
   needsRedraw = true;
   Serial.printf("mode: %s\n", displayModeName(displayMode));
 }
@@ -110,9 +122,22 @@ static void nextDisplayMode() {
   }
 }
 
-// --- Web UI: mode switching + restart from a browser on the LAN ---
+// Sound-bar colour; web-adjustable and persisted to NVS.
+static uint8_t barR = 255, barG = 120, barB = 0;
+static uint16_t barColor = rgb565(255, 120, 0);
+
+static void setBarColor(uint8_t r, uint8_t g, uint8_t b) {
+  barR = r;
+  barG = g;
+  barB = b;
+  barColor = rgb565(r, g, b);
+  needsRedraw = true;
+}
+
+// --- Web UI: mode switching, brightness, bar colour + restart from a browser ---
 
 static WebServer httpServer(80);
+static Preferences prefs;
 
 static const char kWebPage[] PROGMEM = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8">
@@ -126,18 +151,31 @@ button{width:min(280px,90vw);padding:14px;font-size:17px;border-radius:12px;
 border:1px solid #444;background:#222;color:#eee;cursor:pointer}
 button.active{background:#0a84ff;border-color:#0a84ff;font-weight:600}
 button.danger{margin-top:20px;background:#2a1214;border-color:#7f1d1d;color:#f88}
+label{width:min(280px,90vw);display:flex;align-items:center;gap:12px;
+font-size:15px;color:#aaa;padding:4px 2px}
+input[type=range]{flex:1;accent-color:#0a84ff}
+input[type=color]{margin-left:auto;width:48px;height:34px;border:none;padding:0;
+background:none;cursor:pointer}
 </style></head><body>
 <h1>Album Art Display</h1>
 <button data-m="art">Art</button>
 <button data-m="artbass">Art + Bass</button>
 <button data-m="bars">Sound Bars</button>
 <button data-m="visualizer">Visualizer</button>
+<label>Brightness<input type="range" id="bri" min="8" max="255"></label>
+<label>Bar colour<input type="color" id="barc"></label>
 <button class="danger" id="restart">Restart device</button>
 <script>
 const bs=[...document.querySelectorAll('button[data-m]')];
+const bri=document.getElementById('bri'),barc=document.getElementById('barc');
 async function refresh(){try{const s=await(await fetch('/status')).json();
-bs.forEach(b=>b.classList.toggle('active',b.dataset.m===s.mode));}catch(e){}}
+bs.forEach(b=>b.classList.toggle('active',b.dataset.m===s.mode));
+if(document.activeElement!==bri)bri.value=s.brightness;
+if(document.activeElement!==barc)barc.value=s.barcolor;}catch(e){}}
 bs.forEach(b=>b.onclick=async()=>{await fetch('/mode?set='+b.dataset.m,{method:'POST'});refresh();});
+let bt,ct;
+bri.oninput=()=>{clearTimeout(bt);bt=setTimeout(()=>fetch('/brightness?set='+bri.value,{method:'POST'}),100);};
+barc.oninput=()=>{clearTimeout(ct);ct=setTimeout(()=>fetch('/barcolor?set='+barc.value.slice(1),{method:'POST'}),100);};
 document.getElementById('restart').onclick=async()=>{
 if(confirm('Restart the display?'))await fetch('/restart',{method:'POST'});};
 refresh();setInterval(refresh,3000);
@@ -171,7 +209,10 @@ static void webUiBegin() {
     httpServer.send_P(200, "text/html", kWebPage);
   });
   httpServer.on("/status", HTTP_GET, []() {
-    String json = String("{\"mode\":\"") + displayModeSlug(displayMode) + "\"}";
+    char json[80];
+    snprintf(json, sizeof(json),
+             "{\"mode\":\"%s\",\"brightness\":%u,\"barcolor\":\"#%02x%02x%02x\"}",
+             displayModeSlug(displayMode), baseBrightness, barR, barG, barB);
     httpServer.send(200, "application/json", json);
   });
   httpServer.on("/mode", HTTP_POST, []() {
@@ -181,6 +222,30 @@ static void webUiBegin() {
       return;
     }
     setDisplayMode(mode);
+    httpServer.send(200, "text/plain", "ok");
+  });
+  httpServer.on("/brightness", HTTP_POST, []() {
+    if (!httpServer.hasArg("set")) {
+      httpServer.send(400, "text/plain", "missing set");
+      return;
+    }
+    long v = httpServer.arg("set").toInt();
+    baseBrightness = (uint8_t)constrain(v, 8L, 255L);  // floor: never fully dark
+    needsRedraw = true;
+    prefs.putUChar("bright", baseBrightness);
+    httpServer.send(200, "text/plain", "ok");
+  });
+  httpServer.on("/barcolor", HTTP_POST, []() {
+    String hex = httpServer.arg("set");
+    if (hex.startsWith("#")) hex.remove(0, 1);
+    char* end = nullptr;
+    long rgb = strtol(hex.c_str(), &end, 16);
+    if (hex.length() != 6 || end == nullptr || *end != '\0') {
+      httpServer.send(400, "text/plain", "want RRGGBB");
+      return;
+    }
+    setBarColor((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+    prefs.putUInt("barcolor", (uint32_t)rgb);
     httpServer.send(200, "text/plain", "ok");
   });
   httpServer.on("/restart", HTTP_POST, []() {
@@ -308,14 +373,6 @@ static void composeAndShow(int fill) {
 // Progress bar stays visible.
 static constexpr uint32_t kSpinnerStepMs = 100;  // full revolution ~0.8s
 
-static constexpr uint16_t gray565(uint8_t g) {
-  return (uint16_t)(((g >> 3) << 11) | ((g >> 2) << 5) | (g >> 3));
-}
-
-static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
-  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-}
-
 // Spoke unit directions, clockwise from 12 o'clock.
 static constexpr float kSpokeDir[8][2] = {
     {0, -1}, {0.7071f, -0.7071f}, {1, 0},  {0.7071f, 0.7071f},
@@ -352,8 +409,6 @@ static void composeLoadingAndShow(int step, int fill) {
 #ifdef AUDIO_REACTIVE
 static uint8_t barPeaks[16] = {};
 
-static const uint16_t kBarColor = rgb565(255, 120, 0);
-
 static void composeBarsAndShow(int fill) {
   const AudioLevels& levels = audio.levels();
   memset(canvas, 0, sizeof(canvas));
@@ -370,7 +425,7 @@ static void composeBarsAndShow(int fill) {
     for (int y = 0; y < height; y++) {
       int py = 60 - y;
       for (int dx = 0; dx < 4; dx++) {
-        canvas[py * CANVAS_W + x0 + dx] = kBarColor;
+        canvas[py * CANVAS_W + x0 + dx] = barColor;
       }
     }
 
@@ -559,13 +614,13 @@ static void render() {
   switch (mode) {
     case Mode::Black:
       if (modeChanged) {
-        output.setBrightness(kBaseBrightness);
+        output.setBrightness(baseBrightness);
         output.showBlack();
       }
       needsRedraw = false;
       break;
     case Mode::Loading: {
-      output.setBrightness(kBaseBrightness);
+      output.setBrightness(baseBrightness);
       int step = (int)((millis() / kSpinnerStepMs) % 8);
       int fill = currentFill();
       if (modeChanged || needsRedraw || step != lastStep || fill != lastFill) {
@@ -584,12 +639,15 @@ static void render() {
         // curve so quiet passages sit near the floor and hits slam to max.
         float loud = audio.levels().loudness;
         float curved = powf(constrain(loud, 0.0f, 1.0f), 1.6f);
-        uint8_t bright = (uint8_t)lroundf(
-            kArtBassMinBrightness +
-            curved * (kArtBassMaxBrightness - kArtBassMinBrightness));
+        // Pulse range scales with the web-set base brightness (24..255 at
+        // the default base of 96).
+        float scale = (float)baseBrightness / kBaseBrightness;
+        float lo = kArtBassMinBrightness * scale;
+        float hi = min(255.0f, kArtBassMaxBrightness * scale);
+        uint8_t bright = (uint8_t)lroundf(lo + curved * (hi - lo));
         output.setBrightness(bright);
       } else {
-        output.setBrightness(kBaseBrightness);
+        output.setBrightness(baseBrightness);
       }
 
       if (displayMode == DisplayMode::SoundBars || displayMode == DisplayMode::Visualizer) {
@@ -625,8 +683,27 @@ static void render() {
 
 void setup() {
   Serial.begin(115200);
+
+  // On a cold power-on the 5V rail is still settling under the panel's inrush
+  // and the matrix DMA init can wedge (screen stays dark until a manual
+  // reset). Self-reset once instead: a software restart with power already
+  // stable behaves exactly like pressing the reset button.
+  if (esp_reset_reason() == ESP_RST_POWERON) {
+    Serial.println("boot: cold power-on, settling then self-resetting");
+    delay(500);
+    esp_restart();
+  }
+
+#ifdef AUDIO_REACTIVE
+  // Web-adjustable settings persisted in NVS; loaded before the first paint.
+  prefs.begin("display", false);
+  baseBrightness = prefs.getUChar("bright", kBaseBrightness);
+  uint32_t rgb = prefs.getUInt("barcolor", 0xFF7800UL);
+  setBarColor((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+#endif
+
   output.begin();
-  output.setBrightness(kBaseBrightness);
+  output.setBrightness(baseBrightness);
 
 #ifdef AUDIO_REACTIVE
   modeButton.begin(kModeButtonPin);

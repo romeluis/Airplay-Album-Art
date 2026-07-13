@@ -9,11 +9,14 @@ import hashlib
 import io
 from dataclasses import dataclass
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance
 
 ART_SIZE = 64
 ART_BYTES = ART_SIZE * ART_SIZE * 2  # RGB565
 BLACK_ART_ID = "0" * 16
+
+# Slight contrast boost: the matrix's limited color depth washes flat art out.
+_CONTRAST = 1.15
 
 # Bottom rows the white progress bar overlays; if the art is bright there,
 # the firmware draws a black separator row above the bar.
@@ -53,6 +56,7 @@ def process_artwork(raw: bytes) -> ProcessedArt:
     top = (h - side) // 2
     img = img.crop((left, top, left + side, top + side))
     img = img.resize((ART_SIZE, ART_SIZE), Image.LANCZOS)
+    img = ImageEnhance.Contrast(img).enhance(_CONTRAST)
     return _convert(img, art_id=hashlib.sha256(raw).hexdigest()[:16])
 
 
