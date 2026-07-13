@@ -263,6 +263,24 @@ static void webUiBegin() {
     Serial.println("web: http://albumart.local/");
   }
 }
+
+#ifdef SERVER_MDNS_NAME
+static String wsHost = SERVER_HOST;
+
+// DHCP can move the server: resolve its Bonjour name to an IP at boot (and
+// again while disconnected), falling back to the static SERVER_HOST.
+// Requires MDNS.begin() to have run (webUiBegin).
+static String resolveServerHost() {
+  IPAddress ip = MDNS.queryHost(SERVER_MDNS_NAME);
+  if (ip != IPAddress()) {
+    Serial.printf("ws: %s.local -> %s\n", SERVER_MDNS_NAME, ip.toString().c_str());
+    return ip.toString();
+  }
+  Serial.printf("ws: mDNS lookup of %s.local failed, using %s\n",
+                SERVER_MDNS_NAME, SERVER_HOST);
+  return SERVER_HOST;
+}
+#endif
 #endif
 
 static void handleState(const uint8_t* payload, size_t length) {
@@ -539,6 +557,38 @@ static void render() {
   }
 }
 
+// Boot splash: WiFi symbol at center — arcs pulse upward while connecting
+// (shows the device is on), all-green once connected. The normal render loop
+// paints over it afterwards.
+static void drawWifiSplash(int step, bool connected) {
+  memset(canvas, 0, sizeof(canvas));
+  constexpr float cx = 31.5f;
+  constexpr int cy = 44;
+  const uint16_t dim = gray565(36);
+  const uint16_t lit = connected ? rgb565(60, 220, 90) : rgb565(10, 132, 255);
+
+  for (int dy = 0; dy < 2; dy++) {  // base dot, always bright
+    for (int dx = 0; dx < 2; dx++) {
+      canvas[(cy + dy) * CANVAS_W + 31 + dx] = lit;
+    }
+  }
+
+  int litArcs = connected ? 3 : step % 4;  // 0..3 arcs, cycling upward
+  static constexpr float kArcR[3] = {7.0f, 12.0f, 17.0f};
+  for (int a = 0; a < 3; a++) {
+    uint16_t c = a < litArcs ? lit : dim;
+    int steps = 14 + (int)(kArcR[a] * 2.0f);
+    for (int s = 0; s <= steps; s++) {
+      float th = -0.85f + 1.7f * s / steps;  // ~±49° off vertical
+      int x = (int)lroundf(cx + kArcR[a] * sinf(th));
+      int y = cy - (int)lroundf(kArcR[a] * cosf(th));
+      canvas[y * CANVAS_W + x] = c;
+      canvas[(y + 1) * CANVAS_W + x] = c;  // 2px thick
+    }
+  }
+  output.show(canvas);
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -574,17 +624,27 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.printf("wifi: connecting to %s", WIFI_SSID);
+  int splashStep = 0;
   while (WiFi.status() != WL_CONNECTED) {
+    drawWifiSplash(splashStep++, false);
     delay(250);
     Serial.print(".");
   }
   Serial.printf("\nwifi: connected, ip %s\n", WiFi.localIP().toString().c_str());
+  drawWifiSplash(0, true);  // brief green confirmation, then normal display
+  delay(600);
+  output.showBlack();
 
 #ifdef AUDIO_REACTIVE
   webUiBegin();
 #endif
 
+#if defined(AUDIO_REACTIVE) && defined(SERVER_MDNS_NAME)
+  wsHost = resolveServerHost();
+  webSocket.begin(wsHost, SERVER_PORT, SERVER_PATH);
+#else
   webSocket.begin(SERVER_HOST, SERVER_PORT, SERVER_PATH);
+#endif
   webSocket.onEvent(onWsEvent);
   webSocket.setReconnectInterval(kWsReconnectMs);
   // Detect a silently dead server (Mac mini powered off) and reconnect.
@@ -596,6 +656,19 @@ void loop() {
   audio.update();
   if (modeButton.update()) nextDisplayMode();
   httpServer.handleClient();
+#ifdef SERVER_MDNS_NAME
+  // Server may have rebooted onto a new IP: re-resolve after a minute of
+  // failed reconnects.
+  static uint32_t lastResolveMs = 0;
+  if (!wsConnected && millis() - lastResolveMs > 60000) {
+    lastResolveMs = millis();
+    String host = resolveServerHost();
+    if (host != wsHost) {
+      wsHost = host;
+      webSocket.begin(wsHost, SERVER_PORT, SERVER_PATH);
+    }
+  }
+#endif
 #endif
   webSocket.loop();
   render();

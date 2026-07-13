@@ -25,6 +25,22 @@ def _art_frame(art: ProcessedArt) -> bytes:
     return art.art_id.encode("ascii") + art.rgb565
 
 
+def _peer_str(ws: ServerConnection) -> str:
+    peer = ws.remote_address
+    if isinstance(peer, tuple) and len(peer) >= 2:
+        return f"{peer[0]}:{peer[1]}"
+    return str(peer)
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
 class Broadcaster:
     """Holds the latest state/art and fans them out to connected clients."""
 
@@ -39,7 +55,8 @@ class Broadcaster:
         return self._art
 
     async def handler(self, ws: ServerConnection) -> None:
-        peer = ws.remote_address
+        peer = _peer_str(ws)
+        connected_at = time.monotonic()
         log.info("client connected: %s (%d total)", peer, len(self._clients) + 1)
         self._clients.add(ws)
         try:
@@ -52,7 +69,12 @@ class Broadcaster:
             log.debug("client %s errored: %s", peer, exc)
         finally:
             self._clients.discard(ws)
-            log.info("client disconnected: %s (%d total)", peer, len(self._clients))
+            log.info(
+                "client disconnected: %s after %s (%d total)",
+                peer,
+                _fmt_duration(time.monotonic() - connected_at),
+                len(self._clients),
+            )
 
     def set_state(
         self,
