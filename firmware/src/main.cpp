@@ -20,6 +20,7 @@
 #include "canvas.h"
 #include "mode_button.h"
 #include "secrets.h"
+#include "visualizer.h"
 
 #ifdef OUTPUT_HUB75
 #include "hub75_output.h"
@@ -60,6 +61,7 @@ static WebSocketsClient webSocket;
 #ifdef AUDIO_REACTIVE
 static AudioAnalyzer audio;
 static ModeButton modeButton;
+static Visualizer visualizer;
 
 enum class DisplayMode { Art, ArtBass, SoundBars, Visualizer };
 static DisplayMode displayMode = DisplayMode::Art;
@@ -443,152 +445,6 @@ static void composeBarsAndShow(int fill) {
   output.show(canvas);
 }
 
-// Visualizer mode: iTunes-style particle swirl. Glowing particles orbit a
-// slowly wandering attractor, leaving fading light trails (the canvas decays
-// toward black each frame instead of clearing). A bass-driven core pulses at
-// the center, beats fling the swarm outward in radial bursts (occasionally
-// reversing the swirl direction), and the palette hue drifts continuously.
-
-// Full-saturation HSV -> RGB565.
-static uint16_t hsv565(uint8_t h, uint8_t v) {
-  uint8_t region = h / 43;
-  uint8_t rem = (uint8_t)((h - region * 43) * 6);
-  uint8_t q = (uint8_t)((v * (255 - rem)) >> 8);
-  uint8_t t = (uint8_t)((v * rem) >> 8);
-  switch (region) {
-    case 0: return rgb565(v, t, 0);
-    case 1: return rgb565(q, v, 0);
-    case 2: return rgb565(0, v, t);
-    case 3: return rgb565(0, q, v);
-    case 4: return rgb565(t, 0, v);
-    default: return rgb565(v, 0, q);
-  }
-}
-
-static constexpr int kParticleCount = 48;
-struct Particle {
-  float x, y, vx, vy;
-  uint8_t hueOffset;
-};
-static Particle particles[kParticleCount];
-static float visHueBase = 0.0f;
-static float visSwirl = 1.0f;
-static uint32_t visLastFrameMs = 0;
-static uint32_t visLastBurstMs = 0;
-
-// Per-frame trail decay (~0.81x): a particle's wake glows for ~1/4 second.
-static inline uint16_t fade565(uint16_t c) {
-  uint16_t r = (uint16_t)((((c >> 11) & 0x1F) * 13) >> 4);
-  uint16_t g = (uint16_t)((((c >> 5) & 0x3F) * 13) >> 4);
-  uint16_t b = (uint16_t)(((c & 0x1F) * 13) >> 4);
-  return (uint16_t)((r << 11) | (g << 5) | b);
-}
-
-// Channel-wise max: overlapping glows brighten instead of stomping each other.
-static inline void plotMax(int x, int y, uint16_t c) {
-  if (x < 0 || x >= CANVAS_W || y < 0 || y >= CANVAS_H) return;
-  uint16_t& px = canvas[y * CANVAS_W + x];
-  px = (uint16_t)(max(px & 0xF800, c & 0xF800) | max(px & 0x07E0, c & 0x07E0) |
-                  max(px & 0x001F, c & 0x001F));
-}
-
-static void spawnParticle(Particle& p, float cx, float cy) {
-  float ang = random(0, 628) / 100.0f;
-  float rad = 4.0f + random(0, 180) / 10.0f;
-  p.x = cx + cosf(ang) * rad;
-  p.y = cy + sinf(ang) * rad;
-  float speed = 0.3f + random(0, 60) / 100.0f;  // tangential launch
-  p.vx = -sinf(ang) * speed * visSwirl;
-  p.vy = cosf(ang) * speed * visSwirl;
-  p.hueOffset = (uint8_t)random(0, 64);
-}
-
-static void composeVisualizerAndShow(int fill) {
-  const AudioLevels& levels = audio.levels();
-  uint32_t now = millis();
-  bool restart = now - visLastFrameMs > 500;  // mode just (re)entered
-  visLastFrameMs = now;
-
-  // Attractor wanders on a slow Lissajous path so the swarm's home drifts.
-  float tsec = now / 1000.0f;
-  float cx = 31.5f + 9.0f * sinf(tsec * 0.31f);
-  float cy = 29.0f + 7.0f * sinf(tsec * 0.23f + 1.7f);
-
-  if (restart) {
-    memset(canvas, 0, sizeof(canvas));
-    for (int i = 0; i < kParticleCount; i++) spawnParticle(particles[i], cx, cy);
-  } else {
-    for (int i = 0; i < CANVAS_PX; i++) {
-      if (canvas[i]) canvas[i] = fade565(canvas[i]);
-    }
-  }
-
-  visHueBase += 0.25f + levels.loudness * 1.5f;
-  if (visHueBase >= 256.0f) visHueBase -= 256.0f;
-  uint8_t hueBase = (uint8_t)visHueBase;
-
-  bool burst = levels.loudness > 0.72f && now - visLastBurstMs > 220;
-  if (burst) {
-    visLastBurstMs = now;
-    if (random(0, 4) == 0) visSwirl = -visSwirl;
-  }
-
-  float pull = 0.050f + 0.045f * levels.bass;
-  float swirl = visSwirl * (0.10f + 0.14f * levels.loudness);
-
-  for (int i = 0; i < kParticleCount; i++) {
-    Particle& p = particles[i];
-    float dx = cx - p.x;
-    float dy = cy - p.y;
-    float dist = sqrtf(dx * dx + dy * dy) + 0.01f;
-    float nx = dx / dist;
-    float ny = dy / dist;
-    p.vx += nx * pull - ny * swirl;
-    p.vy += ny * pull + nx * swirl;
-    if (burst) {  // radial kick away from the center
-      p.vx -= nx * (1.2f + random(0, 80) / 100.0f);
-      p.vy -= ny * (1.2f + random(0, 80) / 100.0f);
-    }
-    p.vx *= 0.965f;
-    p.vy *= 0.965f;
-    p.x += p.vx;
-    p.y += p.vy;
-
-    if (p.x < -6 || p.x > CANVAS_W + 6 || p.y < -6 || p.y > CANVAS_H + 6) {
-      spawnParticle(p, cx, cy);
-      continue;
-    }
-
-    // Faster particles glow brighter.
-    float speed = sqrtf(p.vx * p.vx + p.vy * p.vy);
-    uint8_t v = (uint8_t)constrain(120.0f + speed * 220.0f, 0.0f, 255.0f);
-    uint8_t hue = (uint8_t)(hueBase + p.hueOffset);
-    uint16_t bright = hsv565(hue, v);
-    uint16_t dim = hsv565(hue, v >> 1);
-    int px = (int)lroundf(p.x);
-    int py = (int)lroundf(p.y);
-    plotMax(px, py, bright);
-    plotMax(px - 1, py, dim);
-    plotMax(px + 1, py, dim);
-    plotMax(px, py - 1, dim);
-    plotMax(px, py + 1, dim);
-  }
-
-  // Bass core: pulsing glow riding the attractor.
-  int coreR = 1 + (int)lroundf(levels.bass * 5.0f);
-  for (int dy = -coreR; dy <= coreR; dy++) {
-    for (int dx = -coreR; dx <= coreR; dx++) {
-      int d2 = dx * dx + dy * dy;
-      if (d2 > coreR * coreR) continue;
-      uint16_t c = d2 <= 1 ? kWhite
-                           : hsv565(hueBase, (uint8_t)(255 - (200 * d2) / (coreR * coreR + 1)));
-      plotMax((int)cx + dx, (int)cy + dy, c);
-    }
-  }
-
-  drawProgressBar(fill, true);  // colourful background: keep the bar readable
-  output.show(canvas);
-}
 #endif
 
 enum class Mode { Black, Loading, Art };
@@ -657,7 +513,9 @@ static void render() {
           if (displayMode == DisplayMode::SoundBars) {
             composeBarsAndShow(fill);
           } else {
-            composeVisualizerAndShow(fill);
+            visualizer.render(canvas, audio.levels());
+            drawProgressBar(fill, true);  // colourful background: keep bar readable
+            output.show(canvas);
           }
           lastVisualizerMs = now;
           lastFill = fill;
