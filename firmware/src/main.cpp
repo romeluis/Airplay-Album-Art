@@ -10,19 +10,20 @@
 #include <WebSocketsClient.h>
 #include <WiFi.h>
 
+#ifdef AUDIO_REACTIVE
+#include <ESPmDNS.h>
+#include <WebServer.h>
+#endif
+
 #include "audio_analyzer.h"
 #include "canvas.h"
 #include "mode_button.h"
 #include "secrets.h"
 
-#if defined(OUTPUT_HUB75) && defined(OUTPUT_TFT_PREVIEW)
-#error "Define only one output driver: OUTPUT_HUB75 or OUTPUT_TFT_PREVIEW"
-#elif defined(OUTPUT_HUB75)
+#ifdef OUTPUT_HUB75
 #include "hub75_output.h"
-#elif defined(OUTPUT_TFT_PREVIEW)
-#include "tft_preview_output.h"
 #else
-#error "Define an output driver: OUTPUT_HUB75 or OUTPUT_TFT_PREVIEW"
+#error "Define the output driver: OUTPUT_HUB75"
 #endif
 
 static constexpr uint16_t kWhite = 0xFFFF;
@@ -34,21 +35,21 @@ static constexpr uint8_t kBaseBrightness = 96;
 static constexpr uint32_t kVisualizerFrameMs = 33;
 
 #ifdef AUDIO_REACTIVE
+static constexpr uint8_t kArtBassMinBrightness = 24;
+static constexpr uint8_t kArtBassMaxBrightness = 255;
+
+// DevKitC-1 right rail; button to GND, INPUT_PULLUP + active-low read.
 static constexpr uint8_t kModeButtonPin = 21;
 #endif
 
-#if defined(OUTPUT_HUB75)
 static Hub75Output output;
-#else
-static TftPreviewOutput output;
-#endif
 static WebSocketsClient webSocket;
 
 #ifdef AUDIO_REACTIVE
 static AudioAnalyzer audio;
 static ModeButton modeButton;
 
-enum class DisplayMode { Art, ArtBass, SoundBars };
+enum class DisplayMode { Art, ArtBass, SoundBars, Visualizer };
 static DisplayMode displayMode = DisplayMode::Art;
 
 static const char* displayModeName(DisplayMode mode) {
@@ -59,6 +60,8 @@ static const char* displayModeName(DisplayMode mode) {
       return "art+bass";
     case DisplayMode::SoundBars:
       return "sound bars";
+    case DisplayMode::Visualizer:
+      return "visualizer";
   }
   return "unknown";
 }
@@ -83,21 +86,115 @@ static uint16_t canvas[CANVAS_PX];
 static bool needsRedraw = true;
 
 #ifdef AUDIO_REACTIVE
-static void nextDisplayMode() {
-  switch (displayMode) {
-    case DisplayMode::Art:
-      displayMode = DisplayMode::ArtBass;
-      break;
-    case DisplayMode::ArtBass:
-      displayMode = DisplayMode::SoundBars;
-      break;
-    case DisplayMode::SoundBars:
-      displayMode = DisplayMode::Art;
-      break;
-  }
+static void setDisplayMode(DisplayMode mode) {
+  displayMode = mode;
   output.setBrightness(kBaseBrightness);
   needsRedraw = true;
   Serial.printf("mode: %s\n", displayModeName(displayMode));
+}
+
+static void nextDisplayMode() {
+  switch (displayMode) {
+    case DisplayMode::Art:
+      setDisplayMode(DisplayMode::ArtBass);
+      break;
+    case DisplayMode::ArtBass:
+      setDisplayMode(DisplayMode::SoundBars);
+      break;
+    case DisplayMode::SoundBars:
+      setDisplayMode(DisplayMode::Visualizer);
+      break;
+    case DisplayMode::Visualizer:
+      setDisplayMode(DisplayMode::Art);
+      break;
+  }
+}
+
+// --- Web UI: mode switching + restart from a browser on the LAN ---
+
+static WebServer httpServer(80);
+
+static const char kWebPage[] PROGMEM = R"HTML(<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Album Art Display</title>
+<style>
+body{font-family:-apple-system,system-ui,sans-serif;background:#111;color:#eee;
+display:flex;flex-direction:column;gap:12px;align-items:center;padding:32px 16px;margin:0}
+h1{font-size:20px;font-weight:600;margin:0 0 12px}
+button{width:min(280px,90vw);padding:14px;font-size:17px;border-radius:12px;
+border:1px solid #444;background:#222;color:#eee;cursor:pointer}
+button.active{background:#0a84ff;border-color:#0a84ff;font-weight:600}
+button.danger{margin-top:20px;background:#2a1214;border-color:#7f1d1d;color:#f88}
+</style></head><body>
+<h1>Album Art Display</h1>
+<button data-m="art">Art</button>
+<button data-m="artbass">Art + Bass</button>
+<button data-m="bars">Sound Bars</button>
+<button data-m="visualizer">Visualizer</button>
+<button class="danger" id="restart">Restart device</button>
+<script>
+const bs=[...document.querySelectorAll('button[data-m]')];
+async function refresh(){try{const s=await(await fetch('/status')).json();
+bs.forEach(b=>b.classList.toggle('active',b.dataset.m===s.mode));}catch(e){}}
+bs.forEach(b=>b.onclick=async()=>{await fetch('/mode?set='+b.dataset.m,{method:'POST'});refresh();});
+document.getElementById('restart').onclick=async()=>{
+if(confirm('Restart the display?'))await fetch('/restart',{method:'POST'});};
+refresh();setInterval(refresh,3000);
+</script></body></html>)HTML";
+
+static const char* displayModeSlug(DisplayMode mode) {
+  switch (mode) {
+    case DisplayMode::Art:
+      return "art";
+    case DisplayMode::ArtBass:
+      return "artbass";
+    case DisplayMode::SoundBars:
+      return "bars";
+    case DisplayMode::Visualizer:
+      return "visualizer";
+  }
+  return "art";
+}
+
+static bool displayModeFromSlug(const String& slug, DisplayMode& out) {
+  if (slug == "art") out = DisplayMode::Art;
+  else if (slug == "artbass") out = DisplayMode::ArtBass;
+  else if (slug == "bars") out = DisplayMode::SoundBars;
+  else if (slug == "visualizer") out = DisplayMode::Visualizer;
+  else return false;
+  return true;
+}
+
+static void webUiBegin() {
+  httpServer.on("/", HTTP_GET, []() {
+    httpServer.send_P(200, "text/html", kWebPage);
+  });
+  httpServer.on("/status", HTTP_GET, []() {
+    String json = String("{\"mode\":\"") + displayModeSlug(displayMode) + "\"}";
+    httpServer.send(200, "application/json", json);
+  });
+  httpServer.on("/mode", HTTP_POST, []() {
+    DisplayMode mode;
+    if (!httpServer.hasArg("set") || !displayModeFromSlug(httpServer.arg("set"), mode)) {
+      httpServer.send(400, "text/plain", "unknown mode");
+      return;
+    }
+    setDisplayMode(mode);
+    httpServer.send(200, "text/plain", "ok");
+  });
+  httpServer.on("/restart", HTTP_POST, []() {
+    httpServer.send(200, "text/plain", "restarting");
+    delay(100);  // let the response flush before rebooting
+    ESP.restart();
+  });
+  httpServer.begin();
+
+  Serial.printf("web: http://%s/\n", WiFi.localIP().toString().c_str());
+  if (MDNS.begin("albumart")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("web: http://albumart.local/");
+  }
 }
 #endif
 
@@ -255,11 +352,7 @@ static void composeLoadingAndShow(int step, int fill) {
 #ifdef AUDIO_REACTIVE
 static uint8_t barPeaks[16] = {};
 
-static uint16_t barColor(int y) {
-  if (y < 18) return rgb565(255, 255, 255);
-  if (y < 36) return rgb565(40, 210, 255);
-  return rgb565(40, 255, 120);
-}
+static const uint16_t kBarColor = rgb565(255, 120, 0);
 
 static void composeBarsAndShow(int fill) {
   const AudioLevels& levels = audio.levels();
@@ -276,16 +369,15 @@ static void composeBarsAndShow(int fill) {
     int x0 = band * 4;
     for (int y = 0; y < height; y++) {
       int py = 60 - y;
-      uint16_t color = barColor(py);
-      for (int dx = 0; dx < 3; dx++) {
-        canvas[py * CANVAS_W + x0 + dx] = color;
+      for (int dx = 0; dx < 4; dx++) {
+        canvas[py * CANVAS_W + x0 + dx] = kBarColor;
       }
     }
 
     if (barPeaks[band] > 0) {
       int peakY = 60 - barPeaks[band];
       if (peakY >= 0 && peakY < CANVAS_H) {
-        for (int dx = 0; dx < 3; dx++) {
+        for (int dx = 0; dx < 4; dx++) {
           canvas[peakY * CANVAS_W + x0 + dx] = kWhite;
         }
       }
@@ -293,6 +385,153 @@ static void composeBarsAndShow(int fill) {
   }
 
   drawProgressBar(fill, false);
+  output.show(canvas);
+}
+
+// Visualizer mode: iTunes-style particle swirl. Glowing particles orbit a
+// slowly wandering attractor, leaving fading light trails (the canvas decays
+// toward black each frame instead of clearing). A bass-driven core pulses at
+// the center, beats fling the swarm outward in radial bursts (occasionally
+// reversing the swirl direction), and the palette hue drifts continuously.
+
+// Full-saturation HSV -> RGB565.
+static uint16_t hsv565(uint8_t h, uint8_t v) {
+  uint8_t region = h / 43;
+  uint8_t rem = (uint8_t)((h - region * 43) * 6);
+  uint8_t q = (uint8_t)((v * (255 - rem)) >> 8);
+  uint8_t t = (uint8_t)((v * rem) >> 8);
+  switch (region) {
+    case 0: return rgb565(v, t, 0);
+    case 1: return rgb565(q, v, 0);
+    case 2: return rgb565(0, v, t);
+    case 3: return rgb565(0, q, v);
+    case 4: return rgb565(t, 0, v);
+    default: return rgb565(v, 0, q);
+  }
+}
+
+static constexpr int kParticleCount = 48;
+struct Particle {
+  float x, y, vx, vy;
+  uint8_t hueOffset;
+};
+static Particle particles[kParticleCount];
+static float visHueBase = 0.0f;
+static float visSwirl = 1.0f;
+static uint32_t visLastFrameMs = 0;
+static uint32_t visLastBurstMs = 0;
+
+// Per-frame trail decay (~0.81x): a particle's wake glows for ~1/4 second.
+static inline uint16_t fade565(uint16_t c) {
+  uint16_t r = (uint16_t)((((c >> 11) & 0x1F) * 13) >> 4);
+  uint16_t g = (uint16_t)((((c >> 5) & 0x3F) * 13) >> 4);
+  uint16_t b = (uint16_t)(((c & 0x1F) * 13) >> 4);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Channel-wise max: overlapping glows brighten instead of stomping each other.
+static inline void plotMax(int x, int y, uint16_t c) {
+  if (x < 0 || x >= CANVAS_W || y < 0 || y >= CANVAS_H) return;
+  uint16_t& px = canvas[y * CANVAS_W + x];
+  px = (uint16_t)(max(px & 0xF800, c & 0xF800) | max(px & 0x07E0, c & 0x07E0) |
+                  max(px & 0x001F, c & 0x001F));
+}
+
+static void spawnParticle(Particle& p, float cx, float cy) {
+  float ang = random(0, 628) / 100.0f;
+  float rad = 4.0f + random(0, 180) / 10.0f;
+  p.x = cx + cosf(ang) * rad;
+  p.y = cy + sinf(ang) * rad;
+  float speed = 0.3f + random(0, 60) / 100.0f;  // tangential launch
+  p.vx = -sinf(ang) * speed * visSwirl;
+  p.vy = cosf(ang) * speed * visSwirl;
+  p.hueOffset = (uint8_t)random(0, 64);
+}
+
+static void composeVisualizerAndShow(int fill) {
+  const AudioLevels& levels = audio.levels();
+  uint32_t now = millis();
+  bool restart = now - visLastFrameMs > 500;  // mode just (re)entered
+  visLastFrameMs = now;
+
+  // Attractor wanders on a slow Lissajous path so the swarm's home drifts.
+  float tsec = now / 1000.0f;
+  float cx = 31.5f + 9.0f * sinf(tsec * 0.31f);
+  float cy = 29.0f + 7.0f * sinf(tsec * 0.23f + 1.7f);
+
+  if (restart) {
+    memset(canvas, 0, sizeof(canvas));
+    for (int i = 0; i < kParticleCount; i++) spawnParticle(particles[i], cx, cy);
+  } else {
+    for (int i = 0; i < CANVAS_PX; i++) {
+      if (canvas[i]) canvas[i] = fade565(canvas[i]);
+    }
+  }
+
+  visHueBase += 0.25f + levels.loudness * 1.5f;
+  if (visHueBase >= 256.0f) visHueBase -= 256.0f;
+  uint8_t hueBase = (uint8_t)visHueBase;
+
+  bool burst = levels.loudness > 0.72f && now - visLastBurstMs > 220;
+  if (burst) {
+    visLastBurstMs = now;
+    if (random(0, 4) == 0) visSwirl = -visSwirl;
+  }
+
+  float pull = 0.050f + 0.045f * levels.bass;
+  float swirl = visSwirl * (0.10f + 0.14f * levels.loudness);
+
+  for (int i = 0; i < kParticleCount; i++) {
+    Particle& p = particles[i];
+    float dx = cx - p.x;
+    float dy = cy - p.y;
+    float dist = sqrtf(dx * dx + dy * dy) + 0.01f;
+    float nx = dx / dist;
+    float ny = dy / dist;
+    p.vx += nx * pull - ny * swirl;
+    p.vy += ny * pull + nx * swirl;
+    if (burst) {  // radial kick away from the center
+      p.vx -= nx * (1.2f + random(0, 80) / 100.0f);
+      p.vy -= ny * (1.2f + random(0, 80) / 100.0f);
+    }
+    p.vx *= 0.965f;
+    p.vy *= 0.965f;
+    p.x += p.vx;
+    p.y += p.vy;
+
+    if (p.x < -6 || p.x > CANVAS_W + 6 || p.y < -6 || p.y > CANVAS_H + 6) {
+      spawnParticle(p, cx, cy);
+      continue;
+    }
+
+    // Faster particles glow brighter.
+    float speed = sqrtf(p.vx * p.vx + p.vy * p.vy);
+    uint8_t v = (uint8_t)constrain(120.0f + speed * 220.0f, 0.0f, 255.0f);
+    uint8_t hue = (uint8_t)(hueBase + p.hueOffset);
+    uint16_t bright = hsv565(hue, v);
+    uint16_t dim = hsv565(hue, v >> 1);
+    int px = (int)lroundf(p.x);
+    int py = (int)lroundf(p.y);
+    plotMax(px, py, bright);
+    plotMax(px - 1, py, dim);
+    plotMax(px + 1, py, dim);
+    plotMax(px, py - 1, dim);
+    plotMax(px, py + 1, dim);
+  }
+
+  // Bass core: pulsing glow riding the attractor.
+  int coreR = 1 + (int)lroundf(levels.bass * 5.0f);
+  for (int dy = -coreR; dy <= coreR; dy++) {
+    for (int dx = -coreR; dx <= coreR; dx++) {
+      int d2 = dx * dx + dy * dy;
+      if (d2 > coreR * coreR) continue;
+      uint16_t c = d2 <= 1 ? kWhite
+                           : hsv565(hueBase, (uint8_t)(255 - (200 * d2) / (coreR * coreR + 1)));
+      plotMax((int)cx + dx, (int)cy + dy, c);
+    }
+  }
+
+  drawProgressBar(fill, true);  // colourful background: keep the bar readable
   output.show(canvas);
 }
 #endif
@@ -341,17 +580,27 @@ static void render() {
       int fill = currentFill();
 #ifdef AUDIO_REACTIVE
       if (displayMode == DisplayMode::ArtBass) {
-        uint8_t boost = (uint8_t)lroundf(audio.levels().bass * 110.0f);
-        output.setBrightness(constrain(kBaseBrightness + boost, kBaseBrightness, 220));
+        // Loudness-driven pulse: dim floor to full brightness, with a gamma
+        // curve so quiet passages sit near the floor and hits slam to max.
+        float loud = audio.levels().loudness;
+        float curved = powf(constrain(loud, 0.0f, 1.0f), 1.6f);
+        uint8_t bright = (uint8_t)lroundf(
+            kArtBassMinBrightness +
+            curved * (kArtBassMaxBrightness - kArtBassMinBrightness));
+        output.setBrightness(bright);
       } else {
         output.setBrightness(kBaseBrightness);
       }
 
-      if (displayMode == DisplayMode::SoundBars) {
+      if (displayMode == DisplayMode::SoundBars || displayMode == DisplayMode::Visualizer) {
         uint32_t now = millis();
         if (modeChanged || displayModeChanged || needsRedraw || fill != lastFill ||
             now - lastVisualizerMs >= kVisualizerFrameMs) {
-          composeBarsAndShow(fill);
+          if (displayMode == DisplayMode::SoundBars) {
+            composeBarsAndShow(fill);
+          } else {
+            composeVisualizerAndShow(fill);
+          }
           lastVisualizerMs = now;
           lastFill = fill;
           needsRedraw = false;
@@ -396,6 +645,10 @@ void setup() {
   }
   Serial.printf("\nwifi: connected, ip %s\n", WiFi.localIP().toString().c_str());
 
+#ifdef AUDIO_REACTIVE
+  webUiBegin();
+#endif
+
   webSocket.begin(SERVER_HOST, SERVER_PORT, SERVER_PATH);
   webSocket.onEvent(onWsEvent);
   webSocket.setReconnectInterval(kWsReconnectMs);
@@ -407,6 +660,7 @@ void loop() {
 #ifdef AUDIO_REACTIVE
   audio.update();
   if (modeButton.update()) nextDisplayMode();
+  httpServer.handleClient();
 #endif
   webSocket.loop();
   render();

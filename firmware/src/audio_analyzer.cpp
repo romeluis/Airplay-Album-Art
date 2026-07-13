@@ -6,9 +6,12 @@
 #include <math.h>
 
 static constexpr i2s_port_t kI2sPort = I2S_NUM_1;
-static constexpr int kMicSckPin = 35;
-static constexpr int kMicWsPin = 36;
-static constexpr int kMicSdPin = 37;
+// INMP441 on three physically adjacent DevKitC-1 left-rail pins (GPIO9/10/11,
+// below the matrix block; GPIO8 and the strapping pins GPIO3/GPIO46 in between
+// are left free). VDD -> 3V3, GND -> GND, L/R -> GND.
+static constexpr int kMicSckPin = 9;
+static constexpr int kMicWsPin = 10;
+static constexpr int kMicSdPin = 11;
 
 static constexpr float kPi = 3.14159265358979323846f;
 static constexpr float kBandHz[16] = {
@@ -88,6 +91,15 @@ void AudioAnalyzer::analyzeBlock() {
   float rms = sqrtf(rmsSum / kBlockSamples);
   levels_.rms = levels_.rms * 0.82f + rms * 0.18f;
 
+  // Beat emphasis: instantaneous rms against its slow running average.
+  // Compressed music keeps rms pinned near its peak, so peak-relative
+  // loudness barely moves — the ratio against the average still spikes on
+  // hits. Instant attack, exponential decay (~0.5s) between beats.
+  avgRms_ = avgRms_ * 0.99f + rms * 0.01f;
+  float ratio = rms / fmaxf(avgRms_, 0.0015f);
+  float pulse = rms > 0.0015f ? constrain((ratio - 0.85f) / 0.9f, 0.0f, 1.0f) : 0.0f;
+  levels_.loudness = fmaxf(pulse, levels_.loudness * 0.88f);
+
   float magnitudes[kBandCount];
   float maxMag = 0.0f;
   for (int band = 0; band < kBandCount; band++) {
@@ -128,6 +140,7 @@ void AudioAnalyzer::analyzeBlock() {
 void AudioAnalyzer::decay() {
   levels_.rms *= 0.96f;
   levels_.bass *= 0.94f;
+  levels_.loudness *= 0.92f;
   for (int i = 0; i < kBandCount; i++) {
     levels_.bands[i] = levels_.bands[i] > 0 ? levels_.bands[i] - 1 : 0;
   }
@@ -148,6 +161,7 @@ void AudioAnalyzer::analyzeBlock() {}
 void AudioAnalyzer::decay() {
   levels_.rms = 0.0f;
   levels_.bass = 0.0f;
+  levels_.loudness = 0.0f;
   memset(levels_.bands, 0, sizeof(levels_.bands));
 }
 

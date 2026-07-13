@@ -5,6 +5,7 @@
 struct AudioLevels {
   float rms = 0.0f;
   float bass = 0.0f;
+  float loudness = 0.0f;  // beat pulse: rms vs recent average, 0..1
   uint8_t bands[16] = {};
 };
 
@@ -27,5 +28,6 @@ class AudioAnalyzer {
   float samples_[kBlockSamples] = {};
   float dc_ = 0.0f;
   float agc_ = 0.04f;
+  float avgRms_ = 0.01f;
   AudioLevels levels_;
 };

@@ -1,6 +1,5 @@
-// Native 1:1 output for a 64x64 HUB75E RGB LED matrix. The default pin map is
-// for the Adafruit Feather ESP32-S3 Reverse TFT headers, with the built-in TFT
-// unused.
+// Native 1:1 output for a 64x64 HUB75E RGB LED matrix on the
+// ESP32-S3-DevKitC-1 (pin map in hub75_output.cpp).
 #pragma once
 
 #include "output.h"
